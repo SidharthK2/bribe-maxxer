@@ -168,6 +168,56 @@ contract MorphoLiquidatorTest is BaseTest {
         liquidator.liquidate(wstethUsdcParams, borrower, uint256(pos.collateral), 0, 0, swaps);
     }
 
+    // ─── Caller Access Control
+    // ────────────────────────────────────────
+
+    function testLiquidateRevertsUnapprovedCaller() public {
+        if (wstethUsdcParams.loanToken == address(0)) return;
+
+        uint256 collateralAmount = 10 ether;
+        uint256 borrowAmount = 20_000e6;
+        _createUnderwaterPosition(wstethUsdcParams, collateralAmount, borrowAmount, 3);
+
+        Position memory pos = morpho.position(wstethUsdcId, borrower);
+        MorphoLiquidator.SwapStep[] memory swaps = new MorphoLiquidator.SwapStep[](1);
+        bytes memory path = _encodePath(WSTETH, 100, WETH, 500, USDC);
+        swaps[0] = _buildUniV3MultiHopSwap(path, uint256(pos.collateral), 0);
+
+        // Random address is not an approved caller
+        address rando = makeAddr("rando");
+        vm.prank(rando);
+        vm.expectRevert(MorphoLiquidator.NotApprovedCaller.selector);
+        liquidator.liquidate(wstethUsdcParams, borrower, uint256(pos.collateral), 0, 0, swaps);
+
+        vm.clearMockedCalls();
+    }
+
+    function testOwnerCanCallLiquidateWithoutApproval() public {
+        if (wstethUsdcParams.loanToken == address(0)) return;
+
+        uint256 collateralAmount = 10 ether;
+        uint256 borrowAmount = 20_000e6;
+        _createUnderwaterPosition(wstethUsdcParams, collateralAmount, borrowAmount, 3);
+
+        Position memory pos = morpho.position(wstethUsdcId, borrower);
+        MorphoLiquidator.SwapStep[] memory swaps = new MorphoLiquidator.SwapStep[](1);
+        bytes memory path = _encodePath(WSTETH, 100, WETH, 500, USDC);
+        swaps[0] = _buildUniV3MultiHopSwap(path, uint256(pos.collateral), 0);
+
+        // Owner (deployer) can call without being in approvedCallers
+        vm.prank(deployer);
+        (uint256 seized,) = liquidator.liquidate(wstethUsdcParams, borrower, uint256(pos.collateral), 0, 0, swaps);
+        assertGt(seized, 0, "owner must be able to liquidate");
+
+        vm.clearMockedCalls();
+    }
+
+    function testSetApprovedCallerOnlyOwner() public {
+        vm.prank(bot);
+        vm.expectRevert(MorphoLiquidator.NotOwner.selector);
+        liquidator.setApprovedCaller(bot, true);
+    }
+
     // ─── Callback Access Control
     // ────────────────────────────────────────
 

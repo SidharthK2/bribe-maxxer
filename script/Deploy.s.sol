@@ -36,7 +36,11 @@ contract Deploy is Script {
         MorphoLiquidator liq = new MorphoLiquidator(MORPHO_BLUE, targets);
         console.log("MorphoLiquidator deployed at:", address(liq));
 
-        // 2. Approve loan tokens on Morpho (for repayment pull via safeTransferFrom)
+        // 2. Approve the deployer (bot EOA) as a caller — owner is approved implicitly
+        //    Add additional callers here if running multiple bot instances
+        //    liq.setApprovedCaller(additionalBot, true);
+
+        // 3. Approve loan tokens on Morpho (for repayment pull via safeTransferFrom)
         liq.approveToken(USDC, MORPHO_BLUE, type(uint256).max);
         liq.approveToken(WETH, MORPHO_BLUE, type(uint256).max);
         liq.approveToken(USDT, MORPHO_BLUE, type(uint256).max);
@@ -54,6 +58,7 @@ contract Deploy is Script {
 
         for (uint256 i; i < tokens.length; ++i) {
             liq.approveToken(tokens[i], UNISWAP_V3_ROUTER, type(uint256).max);
+            liq.approveToken(tokens[i], UNISWAP_UNIVERSAL_ROUTER, type(uint256).max);
             liq.approveToken(tokens[i], CURVE_ROUTER, type(uint256).max);
         }
 

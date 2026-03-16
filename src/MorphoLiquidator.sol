@@ -20,6 +20,7 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
 
     error NotOwner();
     error NotMorpho();
+    error NotApprovedCaller();
     error TargetNotApproved(address target);
     error SwapFailed(uint256 index);
     error InsufficientProfit(uint256 actual, uint256 minimum);
@@ -53,6 +54,7 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
     // ─────────────────────────────────────────────────────────
 
     mapping(address => bool) public approvedTargets;
+    mapping(address => bool) public approvedCallers;
 
     // ── Constructor
     // ─────────────────────────────────────────────────────
@@ -86,6 +88,8 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
         external
         returns (uint256 seized, uint256 repaid)
     {
+        if (msg.sender != owner && !approvedCallers[msg.sender]) revert NotApprovedCaller();
+
         bytes memory data = abi.encode(
             CallbackData({
                 collateralToken: marketParams.collateralToken,
@@ -146,6 +150,12 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
         for (uint256 i; i < targets.length; ++i) {
             approvedTargets[targets[i]] = approved[i];
         }
+    }
+
+    /// @notice Approve or revoke a caller for liquidate().
+    function setApprovedCaller(address caller, bool approved) external {
+        if (msg.sender != owner) revert NotOwner();
+        approvedCallers[caller] = approved;
     }
 
     /// @notice Approve this contract to spend a token on a spender (for DEX routers using transferFrom).

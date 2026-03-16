@@ -71,6 +71,7 @@ abstract contract BaseTest is Test {
         liquidator.approveToken(WSTETH, UNISWAP_V3_ROUTER, type(uint256).max);
         liquidator.approveToken(WETH, UNISWAP_V3_ROUTER, type(uint256).max);
         liquidator.approveToken(USDC, UNISWAP_V3_ROUTER, type(uint256).max);
+        liquidator.setApprovedCaller(bot, true);
         vm.stopPrank();
 
         _setupWstethUsdcMarket();
