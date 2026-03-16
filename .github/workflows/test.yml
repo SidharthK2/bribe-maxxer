@@ -1,0 +1,85 @@
+name: CI
+
+permissions: {}
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  solidity:
+    name: Solidity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Forge fmt
+        run: forge fmt --check
+
+      - name: Forge build
+        run: forge build --sizes
+
+      - name: Forge test (unit)
+        run: forge test -vvv
+        env:
+          FOUNDRY_PROFILE: ci
+
+      - name: Forge test (fork)
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        run: forge test --fork-url "$MAINNET_RPC_URL" -vvv
+        env:
+          FOUNDRY_PROFILE: ci
+          MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+
+  bot:
+    name: Bot
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: bot/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm exec tsc --noEmit
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: [bot]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: docker build -t bribe-maxxer:ci ./bot
