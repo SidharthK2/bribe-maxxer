@@ -192,6 +192,16 @@ export const erc20Abi = [
 
 export const morphoLiquidatorAbi = [
   {
+    name: "setApprovedCaller",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "caller", type: "address" },
+      { name: "approved", type: "bool" },
+    ],
+    outputs: [],
+  },
+  {
     name: "liquidate",
     type: "function",
     stateMutability: "nonpayable",

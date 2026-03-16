@@ -1,14 +1,27 @@
-import { publicClient, walletClient } from "../clients.js";
-import { morphoLiquidatorAbi } from "../utils/abis.js";
+import { publicClient } from "../clients.js";
 import { config } from "../config.js";
 import type { LiquidationOpportunity } from "../markets/types.js";
 import { getBestQuote, buildSwapStep } from "../simulation/swapQuoter.js";
 import { simulateLiquidation } from "../simulation/simulator.js";
-import { estimateProfit } from "../simulation/profitCalculator.js";
-import { getCurrentGasPrice, getGasEstimate } from "../simulation/gasEstimator.js";
-import { getTokenInfo, formatTokenAmount, tokenToFloat } from "../utils/tokenInfo.js";
+import {
+  estimateProfit,
+  computeBribe,
+} from "../simulation/profitCalculator.js";
+import {
+  getCurrentGasPrice,
+  getGasEstimate,
+} from "../simulation/gasEstimator.js";
+import {
+  getTokenInfo,
+  formatTokenAmount,
+} from "../utils/tokenInfo.js";
 import { logLiquidation } from "../db/database.js";
 import { log, logError, notify } from "../utils/logger.js";
+import { signLiquidationTx } from "./bundleBuilder.js";
+import { sendBundle, sendProtectTx } from "./flashbotsClient.js";
+import { acquireNonce, releaseNonce } from "./nonceManager.js";
+
+const MIN_PRIORITY_FEE = 2_000_000_000n; // 2 gwei floor
 
 /**
  * Full execution pipeline for a liquidation opportunity:
@@ -16,7 +29,7 @@ import { log, logError, notify } from "../utils/logger.js";
  * 2. Build swap steps for on-chain callback
  * 3. Simulate the full liquidation via eth_call
  * 4. Calculate profit in ETH and USD
- * 5. Execute (or log in dry-run mode)
+ * 5. Execute via Flashbots bundle (fallback: Flashbots Protect)
  */
 export async function executeLiquidation(
   opportunity: LiquidationOpportunity,
@@ -36,7 +49,9 @@ export async function executeLiquidation(
   );
 
   if (!quote) {
-    logError(`No swap route for ${market.label} (${collateralInfo.symbol} → ${loanInfo.symbol})`);
+    logError(
+      `No swap route for ${market.label} (${collateralInfo.symbol} → ${loanInfo.symbol})`,
+    );
     return;
   }
 
@@ -70,9 +85,13 @@ export async function executeLiquidation(
     sim.gasEstimate,
     gasPrice,
     config.minProfitUsd,
+    config.bridePercentage,
   );
 
-  const grossStr = formatTokenAmount(profit.grossProfitLoanToken, loanInfo.decimals);
+  const grossStr = formatTokenAmount(
+    profit.grossProfitLoanToken,
+    loanInfo.decimals,
+  );
   const netEthStr = (Number(profit.netProfitEth) / 1e18).toFixed(5);
   const gasCostEthStr = (Number(profit.gasCostEth) / 1e18).toFixed(5);
 
@@ -89,7 +108,17 @@ export async function executeLiquidation(
       `net=${netEthStr} ETH ($${profit.netProfitUsd.toFixed(2)}), gas=${gasCostEthStr} ETH`,
   );
 
-  // 5. Dry run check
+  // 5. Gas price circuit breaker
+  const { baseFee: currentBaseFee } = getGasEstimate();
+  const maxGasWei = BigInt(config.maxGasPriceGwei) * 1_000_000_000n;
+  if (currentBaseFee > maxGasWei) {
+    log(
+      `Gas too high: ${Number(currentBaseFee) / 1e9} gwei > ${config.maxGasPriceGwei} gwei max. Skipping.`,
+    );
+    return;
+  }
+
+  // Dry run check
   if (config.dryRun) {
     await notify(
       `[DRY RUN] Would liquidate ${borrower} in ${market.label} | ` +
@@ -99,53 +128,161 @@ export async function executeLiquidation(
     return;
   }
 
-  // 6. Execute via direct transaction
-  // TODO: Phase 4 — Replace with Flashbots bundle submission
+  // Acquire nonce (serializes execution across all markets)
+  const nonce = await acquireNonce();
+  if (nonce === null) {
+    log(`Skipping ${borrower} in ${market.label}: another liquidation in-flight`);
+    return;
+  }
+
+  let included = false;
   try {
-    const { maxFeePerGas, priorityFee } = getGasEstimate();
+    // Compute bribe as priority fee per gas
+    const bribePerGas = computeBribe(profit.grossProfitEth, sim.gasEstimate, config.bridePercentage);
+    const { baseFee } = getGasEstimate();
+    const bufferedBaseFee = baseFee + (baseFee * 13n) / 100n;
+    const effectivePriority =
+      bribePerGas > MIN_PRIORITY_FEE ? bribePerGas : MIN_PRIORITY_FEE;
+    const gasLimit = sim.gasEstimate + (sim.gasEstimate * 20n) / 100n;
 
-    await notify(`Executing liquidation: ${borrower} in ${market.label} | est profit: ${netEthStr} ETH`);
+    // On-chain minProfit: 50% of gross profit in loan token as safety backstop
+    const minProfit = profit.grossProfitLoanToken / 2n;
 
-    const hash = await walletClient.writeContract({
-      address: config.flashLiquidator,
-      abi: morphoLiquidatorAbi,
-      functionName: "liquidate",
-      args: [
-        market.params,
-        borrower,
-        collateral,
-        0n,
-        0n, // minProfit — set to 0 for now, contract handles atomically
-        [swapStep],
-      ],
-      maxFeePerGas,
-      maxPriorityFeePerGas: priorityFee,
+    // Sign the transaction
+    const { signedTx, txHash } = await signLiquidationTx({
+      marketParams: market.params,
+      borrower,
+      seizedAssets: collateral,
+      swaps: [swapStep],
+      minProfit,
+      maxFeePerGas: bufferedBaseFee + effectivePriority,
+      maxPriorityFeePerGas: effectivePriority,
+      gasLimit,
+      nonce,
     });
 
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    const currentBlock = await publicClient.getBlockNumber();
+    const targetBlock = Number(currentBlock) + 1;
+    const maxBlock = targetBlock + config.bundleMaxRetries - 1;
+
+    await notify(
+      `Bundle: ${borrower} in ${market.label} | profit: ${netEthStr} ETH | ` +
+        `bribe: ${(Number(effectivePriority) / 1e9).toFixed(2)} gwei/gas | ` +
+        `blocks=[${targetBlock},${maxBlock}]`,
+    );
+
+    // Send bundle to MEV-Share (targets multiple builders)
+    const bundleResult = await sendBundle(signedTx, targetBlock, maxBlock);
+    const bundleHash = bundleResult?.bundleHash ?? null;
+
+    // Wait for inclusion across the target block range
+    let receipt = await publicClient
+      .waitForTransactionReceipt({
+        hash: txHash,
+        timeout: 15_000 * config.bundleMaxRetries,
+        pollingInterval: 2_000,
+      })
+      .catch(() => null);
+
+    // Fallback: Flashbots Protect (private mempool, wider builder access)
+    if (!receipt) {
+      log(
+        `Bundle not included by block ${maxBlock}, falling back to Protect...`,
+      );
+      const protectMaxBlock = maxBlock + 5;
+      await sendProtectTx(signedTx, protectMaxBlock);
+
+      receipt = await publicClient
+        .waitForTransactionReceipt({
+          hash: txHash,
+          timeout: 75_000,
+          pollingInterval: 2_000,
+        })
+        .catch(() => null);
+    }
+
+    // Neither bundle nor Protect landed
+    if (!receipt) {
+      logLiquidation(
+        market.id,
+        borrower,
+        sim.seized.toString(),
+        sim.repaid.toString(),
+        null,
+        null,
+        txHash,
+        bundleHash,
+        "expired",
+        `not included via Flashbots`,
+      );
+      await notify(
+        `EXPIRED: ${borrower} in ${market.label} | bundle=${bundleHash}`,
+      );
+      return;
+    }
+
+    // Tx landed on chain
+    included = true;
+
     const actualGasCost = receipt.gasUsed * receipt.effectiveGasPrice;
     const actualGasEth = (Number(actualGasCost) / 1e18).toFixed(5);
-
-    const actualGasCostUsd = (Number(actualGasCost) / 1e18) * (profit.netProfitUsd / (Number(profit.netProfitEth) / 1e18) || 0);
+    const ethPriceRatio =
+      Number(profit.netProfitEth) !== 0
+        ? profit.netProfitUsd / (Number(profit.netProfitEth) / 1e18)
+        : 0;
+    const actualGasCostUsd = (Number(actualGasCost) / 1e18) * ethPriceRatio;
 
     if (receipt.status === "reverted") {
-      logLiquidation(market.id, borrower, sim.seized.toString(), sim.repaid.toString(), null, actualGasCostUsd || null, hash, null, "reverted", `block=${receipt.blockNumber}`);
-      await notify(`REVERTED: ${borrower} in ${market.label} | tx=${hash} | gas=${actualGasEth} ETH`);
+      logLiquidation(
+        market.id,
+        borrower,
+        sim.seized.toString(),
+        sim.repaid.toString(),
+        null,
+        actualGasCostUsd || null,
+        txHash,
+        bundleHash,
+        "reverted",
+        `block=${receipt.blockNumber}`,
+      );
+      await notify(
+        `REVERTED: ${borrower} in ${market.label} | tx=${txHash} | gas=${actualGasEth} ETH`,
+      );
       return;
     }
 
     logLiquidation(
-      market.id, borrower, sim.seized.toString(), sim.repaid.toString(),
-      profit.netProfitUsd, actualGasCostUsd || null, hash, null, "included",
+      market.id,
+      borrower,
+      sim.seized.toString(),
+      sim.repaid.toString(),
+      profit.netProfitUsd,
+      actualGasCostUsd || null,
+      txHash,
+      bundleHash,
+      "included",
       `block=${receipt.blockNumber}`,
     );
     await notify(
-      `SUCCESS: ${borrower} in ${market.label} | tx=${hash} | block=${receipt.blockNumber} | ` +
-        `profit=${netEthStr} ETH ($${profit.netProfitUsd.toFixed(2)}) | gas=${actualGasEth} ETH`,
+      `SUCCESS: ${borrower} in ${market.label} | tx=${txHash} | block=${receipt.blockNumber} | ` +
+        `profit=${netEthStr} ETH ($${profit.netProfitUsd.toFixed(2)}) | gas=${actualGasEth} ETH | bundle=${bundleHash}`,
     );
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logLiquidation(market.id, borrower, null, null, null, null, "", null, "failed", errMsg);
+    logLiquidation(
+      market.id,
+      borrower,
+      null,
+      null,
+      null,
+      null,
+      "",
+      null,
+      "failed",
+      errMsg,
+    );
     await notify(`FAILED: ${borrower} in ${market.label} | error=${errMsg}`);
+  } finally {
+    releaseNonce(included);
   }
 }

@@ -27,9 +27,12 @@ export interface ProfitEstimate {
 let cachedEthPriceUsd = 0; // USD with 2 decimal precision
 let ethPriceCacheBlock = 0n;
 
+const MAX_CHAINLINK_STALENESS = 3600; // 1 hour — ETH/USD heartbeat is 1h
+
 /**
  * Get ETH price in USD from Chainlink ETH/USD feed.
  * Cached per block to avoid redundant RPC calls.
+ * Validates staleness: rejects prices older than MAX_CHAINLINK_STALENESS.
  */
 async function getEthPriceUsd(): Promise<number> {
   const currentBlock = await publicClient.getBlockNumber();
@@ -45,13 +48,27 @@ async function getEthPriceUsd(): Promise<number> {
     });
 
     // Chainlink ETH/USD returns 8 decimals
-    const [, answer] = result;
+    const [, answer, , updatedAt] = result;
+
+    // Staleness check: reject prices older than 1 hour
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    if (now - updatedAt > BigInt(MAX_CHAINLINK_STALENESS)) {
+      logError(`Chainlink ETH/USD stale: updatedAt=${updatedAt}, now=${now}`);
+      return cachedEthPriceUsd > 0 ? cachedEthPriceUsd : 0;
+    }
+
+    // Sanity check: price must be positive
+    if (answer <= 0n) {
+      logError(`Chainlink ETH/USD returned non-positive: ${answer}`);
+      return cachedEthPriceUsd > 0 ? cachedEthPriceUsd : 0;
+    }
+
     cachedEthPriceUsd = Number(answer) / 1e8;
     ethPriceCacheBlock = currentBlock;
     return cachedEthPriceUsd;
   } catch {
-    // Fallback: if we have a cached value use it, otherwise assume $3000
-    return cachedEthPriceUsd > 0 ? cachedEthPriceUsd : 3000;
+    // Fallback: use cached value only, return 0 if no cache (will make profit calc reject)
+    return cachedEthPriceUsd > 0 ? cachedEthPriceUsd : 0;
   }
 }
 

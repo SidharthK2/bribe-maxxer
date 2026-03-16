@@ -3,16 +3,25 @@ import { serve } from "@hono/node-server";
 import { config } from "../config.js";
 import { marketRegistry } from "../markets/discovery.js";
 import { getRecentLiquidations, getLiquidationStats } from "../db/database.js";
+import { getPositionCount } from "../core/positionCache.js";
 import { log } from "../utils/logger.js";
 
 const app = new Hono();
 const startedAt = Date.now();
 let lastBlockSeen = 0n;
 let lastCycleAt = 0;
+let lastEvaluatedMarkets = 0;
+let lastDirtyPositions = 0;
 
-export function updateMonitoringState(block: bigint): void {
+export function updateMonitoringState(
+  block: bigint,
+  evaluated?: number,
+  dirty?: number,
+): void {
   lastBlockSeen = block;
   lastCycleAt = Date.now();
+  if (evaluated !== undefined) lastEvaluatedMarkets = evaluated;
+  if (dirty !== undefined) lastDirtyPositions = dirty;
 }
 
 app.get("/health", (c) => {
@@ -22,6 +31,9 @@ app.get("/health", (c) => {
     lastBlockSeen: lastBlockSeen.toString(),
     lastCycleAgo: lastCycleAt ? Math.floor((Date.now() - lastCycleAt) / 1000) : null,
     activeMarkets: marketRegistry.size,
+    cachedPositions: getPositionCount(),
+    lastEvaluatedMarkets,
+    lastDirtyPositions,
     dryRun: config.dryRun,
   });
 });

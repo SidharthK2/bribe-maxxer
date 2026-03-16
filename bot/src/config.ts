@@ -10,6 +10,8 @@ export interface Config {
   minMarketBorrowUsd: number;
   maxConcurrentMarkets: number;
   bundleMaxRetries: number;
+  bridePercentage: number;
+  maxGasPriceGwei: number;
   dryRun: boolean;
   discordWebhookUrl: string;
   port: number;
@@ -69,7 +71,9 @@ function loadConfig(): Config {
     minProfitUsd: Number(process.env.MIN_PROFIT_USD || "5"),
     minMarketBorrowUsd: Number(process.env.MIN_MARKET_BORROW_USD || "10000"),
     maxConcurrentMarkets: Number(process.env.MAX_CONCURRENT_MARKETS || "20"),
-    bundleMaxRetries: Number(process.env.BUNDLE_MAX_RETRIES || "3"),
+    bundleMaxRetries: Number(process.env.BUNDLE_MAX_RETRIES || "6"),
+    bridePercentage: Number(process.env.BRIBE_PERCENTAGE || "0.9"),
+    maxGasPriceGwei: Number(process.env.MAX_GAS_PRICE_GWEI || "200"),
     dryRun: process.env.DRY_RUN === "true",
     discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL || "",
     port: Number(process.env.PORT || "3000"),

@@ -1,8 +1,14 @@
 import { WAD, ORACLE_PRICE_SCALE, LIQUIDATION_CURSOR, MAX_LIQUIDATION_INCENTIVE_FACTOR } from "../markets/constants.js";
 
+// Morpho Blue virtual offsets for share math (SharesMathLib.sol)
+const VIRTUAL_SHARES = 1_000_000n;
+const VIRTUAL_ASSETS = 1n;
+
 /**
  * Check if a position is unhealthy (liquidatable).
- * borrowAssets * ORACLE_PRICE_SCALE > collateral * oraclePrice * lltv / WAD
+ * Replicates Morpho's exact _isHealthy with two-step truncating division:
+ *   maxBorrow = floor(collateral * price / ORACLE_PRICE_SCALE) * lltv / WAD
+ *   unhealthy = borrowed > maxBorrow
  */
 export function isUnhealthy(
   borrowAssets: bigint,
@@ -11,20 +17,25 @@ export function isUnhealthy(
   lltv: bigint,
 ): boolean {
   if (borrowAssets === 0n || collateral === 0n) return false;
-  return borrowAssets * ORACLE_PRICE_SCALE > (collateral * oraclePrice * lltv) / WAD;
+  // Two-step truncation matching Morpho's mulDivDown then wMulDown
+  const collateralValue = (collateral * oraclePrice) / ORACLE_PRICE_SCALE;
+  const maxBorrow = (collateralValue * lltv) / WAD;
+  return borrowAssets > maxBorrow;
 }
 
 /**
  * Convert borrow shares to borrow assets, rounding up.
- * borrowAssets = (borrowShares * totalBorrowAssets + totalBorrowShares - 1) / totalBorrowShares
+ * Matches Morpho Blue's SharesMathLib.toAssetsUp with virtual offsets:
+ *   mulDivUp(shares, totalAssets + VIRTUAL_ASSETS, totalShares + VIRTUAL_SHARES)
  */
 export function sharesToAssetsUp(
   shares: bigint,
   totalAssets: bigint,
   totalShares: bigint,
 ): bigint {
-  if (totalShares === 0n) return 0n;
-  return (shares * totalAssets + totalShares - 1n) / totalShares;
+  const denominator = totalShares + VIRTUAL_SHARES;
+  const numerator = shares * (totalAssets + VIRTUAL_ASSETS);
+  return (numerator + denominator - 1n) / denominator;
 }
 
 /**
